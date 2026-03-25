@@ -1,8 +1,8 @@
 """
-KV Cache Quantizer — rotation + per-group 3-bit.
+KV Cache Quantizer — Hadamard rotation + per-group 3-bit.
 
-Apply random Hadamard-like rotation to spread outliers before quantization.
-Inspired by TurboQuant's PolarQuant approach.
+Uses Walsh-Hadamard transform to uniformize distribution before quantization.
+Better than random rotation — deterministic and optimal for spreading outliers.
 
 Interface contract (do not change function signatures):
   - quantize(tensor: torch.Tensor) -> dict
@@ -11,25 +11,37 @@ Interface contract (do not change function signatures):
 """
 
 import torch
+import math
 
 GROUP_SIZE = 16
 BITS = 3
 MAX_VAL = (1 << BITS) - 1  # 7
 
-# Fixed random rotation matrix (seeded for reproducibility)
-_rotation_cache = {}
+_hadamard_cache = {}
 
 
-def _get_rotation(dim, device, dtype):
-    key = (dim, device, dtype)
-    if key not in _rotation_cache:
-        gen = torch.Generator(device='cpu')
-        gen.manual_seed(42)
-        # Random orthogonal matrix via QR decomposition
-        rand_mat = torch.randn(dim, dim, generator=gen)
-        Q, _ = torch.linalg.qr(rand_mat)
-        _rotation_cache[key] = Q.to(device=device, dtype=dtype)
-    return _rotation_cache[key]
+def _hadamard(n):
+    """Build normalized n×n Hadamard matrix (n must be power of 2)."""
+    if n not in _hadamard_cache:
+        # Build unnormalized, then normalize once at the end
+        H = torch.tensor([[1.0]])
+        while H.shape[0] < n:
+            H = torch.cat([
+                torch.cat([H, H], dim=1),
+                torch.cat([H, -H], dim=1),
+            ], dim=0)
+        H = H / math.sqrt(n)
+        _hadamard_cache[n] = H
+    return _hadamard_cache[n]
+
+
+def _get_hadamard(dim, device, dtype):
+    # Find next power of 2 >= dim
+    n = 1
+    while n < dim:
+        n *= 2
+    H = _hadamard(n).to(device=device, dtype=dtype)
+    return H[:dim, :dim] if n > dim else H
 
 
 def bits_per_value() -> float:
@@ -39,14 +51,14 @@ def bits_per_value() -> float:
 def quantize(tensor: torch.Tensor) -> dict:
     orig_shape = tensor.shape
     dtype = tensor.dtype
-    B, H, S, D = orig_shape
+    B, H_heads, S, D = orig_shape
 
-    # Apply rotation along head_dim to spread outliers
-    R = _get_rotation(D, tensor.device, dtype)
-    t = torch.matmul(tensor, R)  # (B, H, S, D) @ (D, D) -> (B, H, S, D)
+    # Apply Hadamard rotation along head_dim
+    Had = _get_hadamard(D, tensor.device, dtype)
+    t = torch.matmul(tensor, Had)
 
     # Flatten last two dims for group quantization
-    t = t.reshape(B, H, -1)
+    t = t.reshape(B, H_heads, -1)
     N = t.shape[-1]
 
     # Pad to multiple of GROUP_SIZE
@@ -55,7 +67,7 @@ def quantize(tensor: torch.Tensor) -> dict:
         t = torch.nn.functional.pad(t, (0, pad))
 
     # Reshape to groups
-    t = t.reshape(B, H, -1, GROUP_SIZE)
+    t = t.reshape(B, H_heads, -1, GROUP_SIZE)
 
     vmin = t.min(dim=-1, keepdim=True).values
     vmax = t.max(dim=-1, keepdim=True).values
@@ -80,13 +92,13 @@ def dequantize(quantized: dict) -> torch.Tensor:
     vmin = quantized["vmin"].to(dtype)
     t = quantized["data"].to(dtype) * scale + vmin
 
-    B, H, S, D = quantized["shape"]
+    B, H_heads, S, D = quantized["shape"]
     N = quantized["N"]
-    t = t.reshape(B, H, -1)[:, :, :N]
-    t = t.reshape(B, H, S, D)
+    t = t.reshape(B, H_heads, -1)[:, :, :N]
+    t = t.reshape(B, H_heads, S, D)
 
-    # Inverse rotation
-    R = _get_rotation(D, t.device, dtype)
-    t = torch.matmul(t, R.T)
+    # Inverse Hadamard (H is self-inverse when normalized)
+    Had = _get_hadamard(D, t.device, dtype)
+    t = torch.matmul(t, Had)
 
     return t
