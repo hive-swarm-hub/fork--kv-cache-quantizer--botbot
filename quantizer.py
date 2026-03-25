@@ -1,8 +1,7 @@
 """
-KV Cache Quantizer — Hadamard rotation + per-group 3-bit.
+KV Cache Quantizer — Hadamard rotation + bit-packed 4-bit, large groups.
 
-Uses Walsh-Hadamard transform to uniformize distribution before quantization.
-Better than random rotation — deterministic and optimal for spreading outliers.
+Properly bit-packs quantized values and uses large groups to minimize overhead.
 
 Interface contract (do not change function signatures):
   - quantize(tensor: torch.Tensor) -> dict
@@ -13,9 +12,9 @@ Interface contract (do not change function signatures):
 import torch
 import math
 
-GROUP_SIZE = 4
-BITS = 2
-MAX_VAL = (1 << BITS) - 1  # 3
+GROUP_SIZE = 128
+BITS = 4
+MAX_VAL = (1 << BITS) - 1  # 15
 
 _hadamard_cache = {}
 
@@ -23,7 +22,6 @@ _hadamard_cache = {}
 def _hadamard(n):
     """Build normalized n×n Hadamard matrix (n must be power of 2)."""
     if n not in _hadamard_cache:
-        # Build unnormalized, then normalize once at the end
         H = torch.tensor([[1.0]])
         while H.shape[0] < n:
             H = torch.cat([
@@ -36,12 +34,28 @@ def _hadamard(n):
 
 
 def _get_hadamard(dim, device, dtype):
-    # Find next power of 2 >= dim
     n = 1
     while n < dim:
         n *= 2
     H = _hadamard(n).to(device=device, dtype=dtype)
     return H[:dim, :dim] if n > dim else H
+
+
+def _pack_4bit(tensor_uint8):
+    """Pack two 4-bit values into one uint8 byte."""
+    flat = tensor_uint8.reshape(-1)
+    if flat.shape[0] % 2 != 0:
+        flat = torch.nn.functional.pad(flat, (0, 1))
+    packed = (flat[0::2] << 4) | flat[1::2]
+    return packed
+
+
+def _unpack_4bit(packed, orig_numel):
+    """Unpack uint8 bytes into 4-bit values."""
+    high = (packed >> 4) & 0x0F
+    low = packed & 0x0F
+    interleaved = torch.stack([high, low], dim=-1).reshape(-1)
+    return interleaved[:orig_numel]
 
 
 def bits_per_value() -> float:
@@ -76,28 +90,43 @@ def quantize(tensor: torch.Tensor) -> dict:
 
     quantized = ((t - vmin) / scale).round().clamp(0, MAX_VAL).to(torch.uint8)
 
+    # Bit-pack: 2 values per byte for 4-bit
+    packed = _pack_4bit(quantized)
+
     return {
-        "data": quantized,
+        "data": packed,
         "scale": scale.to(torch.float16),
         "vmin": vmin.to(torch.float16),
-        "dtype": dtype,
-        "shape": orig_shape,
+        "qshape": quantized.shape,
+        "orig_shape_0": orig_shape[0],
+        "orig_shape_1": orig_shape[1],
+        "orig_shape_2": orig_shape[2],
+        "orig_shape_3": orig_shape[3],
+        "dtype_str": str(dtype),
         "N": N,
+        "numel": quantized.numel(),
     }
 
 
 def dequantize(quantized: dict) -> torch.Tensor:
-    dtype = quantized["dtype"]
+    dtype = getattr(torch, quantized["dtype_str"].replace("torch.", ""))
+    orig_shape = (quantized["orig_shape_0"], quantized["orig_shape_1"],
+                  quantized["orig_shape_2"], quantized["orig_shape_3"])
+
+    # Unpack
+    data = _unpack_4bit(quantized["data"], quantized["numel"])
+    data = data.reshape(quantized["qshape"])
+
     scale = quantized["scale"].to(dtype)
     vmin = quantized["vmin"].to(dtype)
-    t = quantized["data"].to(dtype) * scale + vmin
+    t = data.to(dtype) * scale + vmin
 
-    B, H_heads, S, D = quantized["shape"]
+    B, H_heads, S, D = orig_shape
     N = quantized["N"]
     t = t.reshape(B, H_heads, -1)[:, :, :N]
     t = t.reshape(B, H_heads, S, D)
 
-    # Inverse Hadamard (H is self-inverse when normalized)
+    # Inverse Hadamard
     Had = _get_hadamard(D, t.device, dtype)
     t = torch.matmul(t, Had)
 
