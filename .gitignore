@@ -1,0 +1,9 @@
+run.log
+results.tsv
+__pycache__/
+*.pyc
+.env
+data/
+*.pt
+*.bin
+*.safetensors
